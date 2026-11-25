@@ -1,0 +1,577 @@
+# Pellet stove: cycle log, pause prediction model, adaptive Energy Saving, heat boost.
+# Delivered to /config/packages/pellet_stove_adaptive.yaml (packages: !include_dir_named packages).
+# Adapt these entity ids to your install: weather.local_forecast (an NWS-style forecast entity),
+# sensor.outside_temperature, climate.room_thermostat (a second room thermometer), notify.notify.
+#
+# Model (fit 2026-11-23 on 16 Energy Saving pauses, local station 45-61 F):
+#   pause_min = (t0 + A * K / (Tmid - OAT)) * c
+#   K = STOP_F + START_F - 3 (raw counts the room falls; START fixed at -2 F, so K = STOP - 1)
+#   Tmid = middle of the stove-display band = setpoint + STOP/2 - 1
+#   OAT = mean of local station now and the local station forecast for the next 3 hours
+#   c = median(measured / predicted) over the last 5 clean pauses, clamped 0.75-1.3
+# t0 and A are input_numbers so they can be refitted without editing this file.
+
+template:
+  # --- Outdoor forecast (local NWS station, the one the model was fitted against)
+  - triggers:
+      - trigger: time_pattern
+        minutes: "/15"
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.local_forecast
+        data:
+          type: hourly
+        response_variable: fc
+        continue_on_error: true
+    sensor:
+      - name: Pellet stove OAT forecast 3h
+        unique_id: pellet_stove_oat_forecast_3h
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {% set rows = fc['weather.local_forecast'].forecast if fc is defined and fc is mapping and 'weather.local_forecast' in fc else [] %}
+          {% set f = rows[:3] | map(attribute='temperature') | select('number') | list %}
+          {% if f | count > 0 %}{{ (f | sum / f | count) | round(1) }}{% else %}{{ states('sensor.outside_temperature') }}{% endif %}
+        attributes:
+          next_12h: >
+            {% set rows = fc['weather.local_forecast'].forecast if fc is defined and fc is mapping and 'weather.local_forecast' in fc else [] %}
+            {{ rows[:12] | map(attribute='temperature') | list }}
+
+  # --- Cycle log: one record per pause and per burn (attributes survive restarts)
+  - triggers:
+      - trigger: state
+        entity_id: sensor.pellet_stove_state
+        not_to: [unknown, unavailable]
+      - trigger: state
+        entity_id: sensor.pellet_stove_phase
+        not_to: [unknown, unavailable]
+      - trigger: state
+        entity_id: climate.room_thermostat
+        attribute: current_temperature
+      - trigger: state
+        entity_id: [number.pellet_stove_power, number.pellet_stove_fan]
+        not_to: [unknown, unavailable]
+      - trigger: time_pattern
+        minutes: "/30"
+    variables:
+      n: >
+        {% set a = this.attributes if this is defined and this.attributes is defined else {} %}
+        {% set ts = now().timestamp() | int %}
+        {% set st = states('sensor.pellet_stove_state') %}
+        {% set seg_new = 'burn' if st in ['Ignition', 'Running', 'Cleaning'] else ('pause' if st == 'Paused' else 'idle') %}
+        {% set seg = a.get('seg', 'idle') %}
+        {% set stove = states('sensor.pellet_stove_room_temperature_stove') | float(0) %}
+        {% set stel = state_attr('climate.room_thermostat', 'current_temperature') | float(0) %}
+        {% set oat = states('sensor.outside_temperature') | float(0) %}
+        {% set phase = states('sensor.pellet_stove_phase') %}
+        {% set lvl = states('number.pellet_stove_power') | int(0) %}
+        {% set fan = states('number.pellet_stove_fan') | int(0) %}
+        {% set dt = [ts - (a.get('last_ts', ts) | int), 0] | max %}
+        {% set pl = a.get('plev', 0) | int %}
+        {% set fl = a.get('pfan', 0) | int %}
+        {% set opt = a.get('pt', [0, 0, 0, 0, 0]) %}
+        {% set oft = a.get('ft', [0, 0, 0, 0, 0]) %}
+        {% set q = namespace(pt=[], ft=[]) %}
+        {% for i in range(5) %}
+          {% set q.pt = q.pt + [(opt[i] if opt | count > i else 0) + (dt if seg == 'burn' and pl == i + 1 else 0)] %}
+          {% set q.ft = q.ft + [(oft[i] if oft | count > i else 0) + (dt if seg == 'burn' and fl == i + 1 else 0)] %}
+        {% endfor %}
+        {% set s_ts = a.get('s_ts', ts) | int %}
+        {% set smin = [a.get('smin', stel) | float(stel), stel] | min if stel > 0 else a.get('smin', 0) %}
+        {% set smax = [a.get('smax', stel) | float(stel), stel] | max if stel > 0 else a.get('smax', 0) %}
+        {% set o = namespace(pauses=a.get('pauses', []), burns=a.get('burns', []), ok_ts=a.get('ok_ts'), ok_stove=a.get('ok_stove')) %}
+        {% if seg == 'burn' and o.ok_ts is none and phase.startswith('LEVEL') and 'OK' in phase %}
+          {% set o.ok_ts = ts %}{% set o.ok_stove = stove %}
+        {% endif %}
+        {% set endtxt = now().strftime('%m-%d %H:%M') %}
+        {% if seg_new != seg and seg == 'pause' %}
+          {% set rec = {'end': endtxt, 'end_ts': ts, 'min': ((ts - s_ts) / 60) | round(0),
+                        'band': a.get('s_band'), 'start': a.get('s_start'), 'sp': a.get('s_sp'),
+                        'oat': ((a.get('s_oat', oat) | float(oat) + oat) / 2) | round(1),
+                        'stove': [a.get('s_stove'), stove], 'stelpro': [smin, smax],
+                        'pred_raw': a.get('s_pred_raw'), 'pred': a.get('s_pred'),
+                        'clean': st == 'Ignition'} %}
+          {% set o.pauses = (o.pauses + [rec])[-12:] %}
+        {% elif seg_new != seg and seg == 'burn' %}
+          {% set to_ok = ((o.ok_ts - s_ts) / 60) | round(0) if o.ok_ts is not none else none %}
+          {% set rate = ((o.ok_stove - (a.get('s_stove', 0) | float(0))) / ((o.ok_ts - s_ts) / 3600)) | round(2)
+                        if o.ok_ts is not none and o.ok_ts > s_ts + 300 else none %}
+          {% set rec = {'end': endtxt, 'end_ts': ts, 'min': ((ts - s_ts) / 60) | round(0), 'to_ok': to_ok,
+                        'stove': [a.get('s_stove'), o.ok_stove, stove], 'stelpro': [a.get('s_stel'), smin, smax],
+                        'rate_f_h': rate, 'p_min': q.pt | map('multiply', 1 / 60) | map('round', 0) | list,
+                        'fan_min': q.ft | map('multiply', 1 / 60) | map('round', 0) | list,
+                        'oat': ((a.get('s_oat', oat) | float(oat) + oat) / 2) | round(1), 'sp': a.get('s_sp'),
+                        'band': a.get('s_band'), 'ended': st} %}
+          {% set o.burns = (o.burns + [rec])[-12:] %}
+        {% endif %}
+        {% set clean = o.pauses | selectattr('clean') | selectattr('pred_raw', 'number') | list %}
+        {% set r = namespace(v=[]) %}
+        {% for p in clean[-5:] %}{% if p.pred_raw > 0 %}{% set r.v = r.v + [p.min / p.pred_raw] %}{% endif %}{% endfor %}
+        {% set rv = r.v | sort %}
+        {% set med = (rv[(rv | count) // 2] if rv | count % 2 == 1 else (rv[(rv | count) // 2 - 1] + rv[(rv | count) // 2]) / 2) if rv | count > 0 else 1 %}
+        {% set corr = ([[med, 0.75] | max, 1.3] | min) | round(3) %}
+        {% set out = {'seg': seg_new, 'last_ts': ts, 'plev': lvl, 'pfan': fan,
+                      'pauses': o.pauses, 'burns': o.burns, 'correction': corr, 'n_ratio': rv | count} %}
+        {% if seg_new != seg %}
+          {% set out = dict(out, s_ts=ts, s_start=endtxt, s_stove=stove, s_stel=stel, s_oat=oat,
+                            s_band=(states('select.pellet_stove_energy_saving_stop') if states('select.pellet_stove_energy_saving_stop') in ['Off', '+2 F', '+4 F', '+6 F'] else states('input_select.pellet_stove_target_energy_saving_stop')),
+                            s_sp=states('input_number.pellet_stove_target_setpoint') | float(0),
+                            s_pred=states('sensor.pellet_stove_predicted_pause') | float(none),
+                            s_pred_raw=state_attr('sensor.pellet_stove_predicted_pause', 'raw') | float(none),
+                            smin=stel, smax=stel, ok_ts=none, ok_stove=none, pt=[0, 0, 0, 0, 0], ft=[0, 0, 0, 0, 0]) %}
+        {% else %}
+          {% set out = dict(out, s_ts=s_ts, s_start=a.get('s_start'), s_stove=a.get('s_stove'), s_stel=a.get('s_stel'),
+                            s_oat=a.get('s_oat'), s_band=a.get('s_band'), s_sp=a.get('s_sp'), s_pred=a.get('s_pred'),
+                            s_pred_raw=a.get('s_pred_raw'), smin=smin, smax=smax, ok_ts=o.ok_ts, ok_stove=o.ok_stove,
+                            pt=q.pt, ft=q.ft) %}
+        {% endif %}
+        {{ out }}
+    sensor:
+      - name: Pellet stove cycle log
+        unique_id: pellet_stove_cycle_log
+        icon: mdi:notebook-outline
+        state: "{{ n.seg }}"
+        attributes:
+          seg: "{{ n.seg }}"
+          last_ts: "{{ n.last_ts }}"
+          plev: "{{ n.plev }}"
+          pfan: "{{ n.pfan }}"
+          pt: "{{ n.pt }}"
+          ft: "{{ n.ft }}"
+          s_ts: "{{ n.s_ts }}"
+          s_start: "{{ n.s_start }}"
+          s_stove: "{{ n.s_stove }}"
+          s_stel: "{{ n.s_stel }}"
+          s_oat: "{{ n.s_oat }}"
+          s_band: "{{ n.s_band }}"
+          s_sp: "{{ n.s_sp }}"
+          s_pred: "{{ n.s_pred }}"
+          s_pred_raw: "{{ n.s_pred_raw }}"
+          smin: "{{ n.smin }}"
+          smax: "{{ n.smax }}"
+          ok_ts: "{{ n.ok_ts }}"
+          ok_stove: "{{ n.ok_stove }}"
+          pauses: "{{ n.pauses }}"
+          burns: "{{ n.burns }}"
+          correction: "{{ n.correction }}"
+          n_ratio: "{{ n.n_ratio }}"
+
+  # --- Model outputs and log views
+  - sensor:
+      - name: Pellet stove model OAT
+        unique_id: pellet_stove_model_oat
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {% set v = [states('sensor.outside_temperature') | float(none), states('sensor.pellet_stove_oat_forecast_3h') | float(none)] | select('number') | list %}
+          {{ (v | sum / v | count) | round(1) if v | count > 0 else none }}
+        availability: "{{ has_value('sensor.outside_temperature') or has_value('sensor.pellet_stove_oat_forecast_3h') }}"
+
+      - name: Pellet stove predicted pause +2
+        unique_id: pellet_stove_predicted_pause_p2
+        unit_of_measurement: min
+        state_class: measurement
+        icon: mdi:chart-bell-curve
+        state: >
+          {% set S = 2 %}
+          {% set sp = states('input_number.pellet_stove_target_setpoint') | float(66) %}
+          {% set oat = states('sensor.pellet_stove_model_oat') | float(none) %}
+          {% set t0 = states('input_number.pellet_stove_model_t0') | float(45) %}
+          {% set A = states('input_number.pellet_stove_model_a') | float(240) %}
+          {% set c = state_attr('sensor.pellet_stove_cycle_log', 'correction') | float(1) %}
+          {% set tmid = sp + S / 2 - 1 %}
+          {% if oat is none %}{{ none }}{% elif tmid - oat <= 3 %}600{% else %}{{ ([(t0 + A * (S - 1) / (tmid - oat)) * c, 600] | min) | round(0) }}{% endif %}
+        availability: "{{ has_value('sensor.pellet_stove_model_oat') }}"
+        attributes:
+          band: "{% set sp = states('input_number.pellet_stove_target_setpoint') | float(66) %}{{ (sp - 1) | int }}-{{ (sp + 2 - 1) | int }} F on the stove reading"
+      - name: Pellet stove predicted pause +4
+        unique_id: pellet_stove_predicted_pause_p4
+        unit_of_measurement: min
+        state_class: measurement
+        icon: mdi:chart-bell-curve
+        state: >
+          {% set S = 4 %}
+          {% set sp = states('input_number.pellet_stove_target_setpoint') | float(66) %}
+          {% set oat = states('sensor.pellet_stove_model_oat') | float(none) %}
+          {% set t0 = states('input_number.pellet_stove_model_t0') | float(45) %}
+          {% set A = states('input_number.pellet_stove_model_a') | float(240) %}
+          {% set c = state_attr('sensor.pellet_stove_cycle_log', 'correction') | float(1) %}
+          {% set tmid = sp + S / 2 - 1 %}
+          {% if oat is none %}{{ none }}{% elif tmid - oat <= 3 %}600{% else %}{{ ([(t0 + A * (S - 1) / (tmid - oat)) * c, 600] | min) | round(0) }}{% endif %}
+        availability: "{{ has_value('sensor.pellet_stove_model_oat') }}"
+        attributes:
+          band: "{% set sp = states('input_number.pellet_stove_target_setpoint') | float(66) %}{{ (sp - 1) | int }}-{{ (sp + 4 - 1) | int }} F on the stove reading"
+      - name: Pellet stove predicted pause +6
+        unique_id: pellet_stove_predicted_pause_p6
+        unit_of_measurement: min
+        state_class: measurement
+        icon: mdi:chart-bell-curve
+        state: >
+          {% set S = 6 %}
+          {% set sp = states('input_number.pellet_stove_target_setpoint') | float(66) %}
+          {% set oat = states('sensor.pellet_stove_model_oat') | float(none) %}
+          {% set t0 = states('input_number.pellet_stove_model_t0') | float(45) %}
+          {% set A = states('input_number.pellet_stove_model_a') | float(240) %}
+          {% set c = state_attr('sensor.pellet_stove_cycle_log', 'correction') | float(1) %}
+          {% set tmid = sp + S / 2 - 1 %}
+          {% if oat is none %}{{ none }}{% elif tmid - oat <= 3 %}600{% else %}{{ ([(t0 + A * (S - 1) / (tmid - oat)) * c, 600] | min) | round(0) }}{% endif %}
+        availability: "{{ has_value('sensor.pellet_stove_model_oat') }}"
+        attributes:
+          band: "{% set sp = states('input_number.pellet_stove_target_setpoint') | float(66) %}{{ (sp - 1) | int }}-{{ (sp + 6 - 1) | int }} F on the stove reading"
+
+      # Prediction for the band the stove is actually on (raw = without the correction c)
+      - name: Pellet stove predicted pause
+        unique_id: pellet_stove_predicted_pause
+        unit_of_measurement: min
+        state_class: measurement
+        icon: mdi:chart-bell-curve-cumulative
+        state: >
+          {% set m = {'+2 F': 'sensor.pellet_stove_predicted_pause_2', '+4 F': 'sensor.pellet_stove_predicted_pause_4', '+6 F': 'sensor.pellet_stove_predicted_pause_6'} %}
+          {% set b = states('select.pellet_stove_energy_saving_stop') %}
+          {% set b = b if b in m or b == 'Off' else states('input_select.pellet_stove_target_energy_saving_stop') %}
+          {{ states(m[b]) | float(none) if b in m else none }}
+        availability: >
+          {% set b = states('select.pellet_stove_energy_saving_stop') %}
+          {% set b = b if b in ['+2 F', '+4 F', '+6 F', 'Off'] else states('input_select.pellet_stove_target_energy_saving_stop') %}
+          {{ b in ['+2 F', '+4 F', '+6 F'] }}
+        attributes:
+          raw: >
+            {% set c = state_attr('sensor.pellet_stove_cycle_log', 'correction') | float(1) %}
+            {% set m = {'+2 F': 'sensor.pellet_stove_predicted_pause_2', '+4 F': 'sensor.pellet_stove_predicted_pause_4', '+6 F': 'sensor.pellet_stove_predicted_pause_6'} %}
+            {% set b = states('select.pellet_stove_energy_saving_stop') %}
+            {% set b = b if b in m or b == 'Off' else states('input_select.pellet_stove_target_energy_saving_stop') %}
+            {{ ((states(m[b]) | float(0)) / c) | round(0) if b in m and c > 0 else none }}
+          formula: "pause = (t0 + A*(STOP-1)/(setpoint + STOP/2 - 1 - OAT)) * c"
+          t0: "{{ states('input_number.pellet_stove_model_t0') | float(45) }}"
+          A: "{{ states('input_number.pellet_stove_model_a') | float(240) }}"
+          correction: "{{ state_attr('sensor.pellet_stove_cycle_log', 'correction') }}"
+          oat: "{{ states('sensor.pellet_stove_model_oat') }}"
+
+      - name: Pellet stove recommended Energy Saving stop
+        unique_id: pellet_stove_recommended_ens_stop
+        icon: mdi:thermometer-check
+        state: >
+          {% set tgt = states('input_number.pellet_stove_pause_target') | float(100) %}
+          {% set ns = namespace(v='Off') %}
+          {% for b in ['6', '4', '2'] %}
+            {% if states('sensor.pellet_stove_predicted_pause_' ~ b) | float(0) >= tgt %}{% set ns.v = '+' ~ b ~ ' F' %}{% endif %}
+          {% endfor %}
+          {{ ns.v }}
+
+      - name: Pellet stove last pause
+        unique_id: pellet_stove_last_pause
+        unit_of_measurement: min
+        state_class: measurement
+        icon: mdi:timer-pause-outline
+        state: >
+          {% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}
+          {{ p[-1].min if p | count > 0 else none }}
+        attributes:
+          predicted: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].pred if p | count > 0 else none }}"
+          band: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].band if p | count > 0 else none }}"
+          oat: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].oat if p | count > 0 else none }}"
+          clean: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].clean if p | count > 0 else none }}"
+          ended: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].end if p | count > 0 else none }}"
+      - name: Pellet stove last pause predicted
+        unique_id: pellet_stove_last_pause_predicted
+        unit_of_measurement: min
+        state_class: measurement
+        icon: mdi:timer-pause-outline
+        state: >
+          {% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}
+          {{ p[-1].pred if p | count > 0 and p[-1].pred is number else none }}
+      - name: Pellet stove model correction
+        unique_id: pellet_stove_model_correction
+        state_class: measurement
+        icon: mdi:tune-variant
+        state: "{{ state_attr('sensor.pellet_stove_cycle_log', 'correction') | float(1) }}"
+      - name: Pellet stove last burn time to setpoint
+        unique_id: pellet_stove_last_burn_to_setpoint
+        unit_of_measurement: min
+        state_class: measurement
+        icon: mdi:timer-play-outline
+        state: >
+          {% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}
+          {{ b[-1].to_ok if b | count > 0 and b[-1].to_ok is number else none }}
+        attributes:
+          power_minutes_p1_p5: "{% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}{{ b[-1].p_min if b | count > 0 else none }}"
+          fan_minutes_1_5: "{% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}{{ b[-1].fan_min if b | count > 0 else none }}"
+          oat: "{% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}{{ b[-1].oat if b | count > 0 else none }}"
+      - name: Pellet stove last burn heating rate
+        unique_id: pellet_stove_last_burn_heating_rate
+        unit_of_measurement: "°F/h"
+        state_class: measurement
+        icon: mdi:thermometer-plus
+        state: >
+          {% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}
+          {{ b[-1].rate_f_h if b | count > 0 and b[-1].rate_f_h is number else none }}
+      # Swing of the ground-floor Stelpro over the last full cycle (burn + following pause): the comfort metric
+      - name: Pellet stove cycle swing
+        unique_id: pellet_stove_cycle_swing
+        unit_of_measurement: "°F"
+        state_class: measurement
+        icon: mdi:arrow-expand-vertical
+        state: >
+          {% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}
+          {% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}
+          {% if p | count > 0 and b | count > 0 %}
+            {% set lo = [p[-1].stelpro[0], b[-1].stelpro[1]] | select('number') | select('>', 0) | list %}
+            {% set hi = [p[-1].stelpro[1], b[-1].stelpro[2]] | select('number') | list %}
+            {{ (hi | max - lo | min) | round(1) if lo and hi else none }}
+          {% else %}{{ none }}{% endif %}
+
+      # Targets the keep-settings automation enforces: the user's targets plus the heat boost
+      - name: Pellet stove effective power target
+        unique_id: pellet_stove_effective_power_target
+        icon: mdi:fire
+        state: >
+          {{ [states('input_number.pellet_stove_target_power') | int(1) + states('input_number.pellet_stove_heat_boost') | int(0),
+              states('input_number.pellet_stove_max_power') | int(5), 5] | min }}
+      - name: Pellet stove effective fan target
+        unique_id: pellet_stove_effective_fan_target
+        icon: mdi:fan
+        state: >
+          {% set f = states('input_number.pellet_stove_target_fan') | int(2) %}
+          {% set p = states('sensor.pellet_stove_effective_power_target') | int(1) %}
+          {% if states('input_number.pellet_stove_heat_boost') | int(0) == 0 %}{{ f }}
+          {% else %}{{ [f, 4 if p >= 4 else (3 if p == 3 else f)] | max }}{% endif %}
+
+  - binary_sensor:
+      # Running but not at setpoint (no "OK" on the LEVEL screen) for an hour: the stove is not keeping up
+      - name: Pellet stove below setpoint
+        unique_id: pellet_stove_below_setpoint
+        icon: mdi:thermometer-low
+        state: >
+          {% set ph = states('sensor.pellet_stove_phase') %}
+          {{ is_state('sensor.pellet_stove_state', 'Running') and ph.startswith('LEVEL') and 'OK' not in ph }}
+        delay_on:
+          minutes: 60
+      - name: Pellet stove holding setpoint
+        unique_id: pellet_stove_holding_setpoint
+        icon: mdi:thermometer-check
+        state: "{{ is_state('sensor.pellet_stove_state', 'Running') and 'OK' in states('sensor.pellet_stove_phase') }}"
+        delay_on:
+          hours: 2
+      - name: Pellet stove Energy Saving off overheat
+        unique_id: pellet_stove_ens_off_overheat
+        icon: mdi:thermometer-alert
+        state: >
+          {{ is_state('input_select.pellet_stove_target_energy_saving_stop', 'Off') and
+             states('sensor.pellet_stove_room_temperature_stove') | float(0) >= states('input_number.pellet_stove_target_setpoint') | float(66) + 4 }}
+        delay_on:
+          minutes: 20
+      - name: Pellet stove Energy Saving narrower ok
+        unique_id: pellet_stove_ens_narrower_ok
+        icon: mdi:arrow-collapse-vertical
+        state: >
+          {% set cur = states('input_select.pellet_stove_target_energy_saving_stop') %}
+          {% set m = {'+4 F': '2', '+6 F': '4'} %}
+          {{ cur in m and states('sensor.pellet_stove_predicted_pause_' ~ m[cur]) | float(0) >= 120 }}
+        delay_on:
+          hours: 3
+      - name: Pellet stove Energy Saving widest ok
+        unique_id: pellet_stove_ens_widest_ok
+        icon: mdi:arrow-expand-vertical
+        state: "{{ states('sensor.pellet_stove_predicted_pause_6') | float(0) >= 110 }}"
+        delay_on:
+          hours: 2
+
+automation:
+  - id: pellet_stove_adaptive_energy_saving
+    alias: "Pellet stove: adaptive Energy Saving"
+    description: >-
+      Picks the Energy Saving STOP band (+2 -> +4 -> +6 -> Off, START -2) with the smallest swing whose predicted pause
+      is >= the pause target (100 min), widening after a measured pause under the floor (90 min). Off only when +6 is
+      predicted short or measured short; back on when the room overheats at P1, +6 predicts >= 110 for 2 h, or the hard
+      cap (stove reading >= setpoint+7 or Stelpro >= 73). >= 3 h between changes (hard cap excepted), max 4 a day.
+      Writes input_select.pellet_stove_target_energy_saving_stop; "Pellet stove: keep HA settings" applies it.
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: "/15"
+      - trigger: state
+        entity_id: sensor.pellet_stove_last_pause
+      - trigger: state
+        entity_id:
+          - binary_sensor.pellet_stove_energy_saving_off_overheat
+          - binary_sensor.pellet_stove_energy_saving_widest_ok
+          - binary_sensor.pellet_stove_energy_saving_narrower_ok
+        to: "on"
+      - trigger: template
+        value_template: &hardcap >
+          {{ is_state('input_select.pellet_stove_target_energy_saving_stop', 'Off') and
+             (states('sensor.pellet_stove_room_temperature_stove') | float(0) >= states('input_number.pellet_stove_target_setpoint') | float(66) + 7
+              or state_attr('climate.room_thermostat', 'current_temperature') | float(0) >= 73) }}
+    # Band names stay inside the decision dict: a bare "+4" template result is parsed to the number 4
+    variables:
+      hard: *hardcap
+      decision: >
+        {% set cur = states('input_select.pellet_stove_target_energy_saving_stop') %}
+        {% set p = {'+2 F': states('sensor.pellet_stove_predicted_pause_2') | float(0),
+                    '+4 F': states('sensor.pellet_stove_predicted_pause_4') | float(0),
+                    '+6 F': states('sensor.pellet_stove_predicted_pause_6') | float(0)} %}
+        {% set tgt = states('input_number.pellet_stove_pause_target') | float(100) %}
+        {% set floor = states('input_number.pellet_stove_pause_floor') | float(90) %}
+        {% set log = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}
+        {% set last = log[-1] if log | count > 0 else none %}
+        {% set last_ok = last is not none and last.clean and last.band == cur and now().timestamp() - (last.end_ts | float(0)) < 8 * 3600 %}
+        {% set ladder = ['+2 F', '+4 F', '+6 F', 'Off'] %}
+        {% set ns = namespace(new=cur, why='') %}
+        {% if cur == 'Off' %}
+          {% if hard or is_state('binary_sensor.pellet_stove_energy_saving_off_overheat', 'on') or is_state('binary_sensor.pellet_stove_energy_saving_widest_ok', 'on') %}
+            {% set ns.new = '+6 F' %}
+            {% for b in ['+6 F', '+4 F', '+2 F'] %}{% if p[b] >= tgt %}{% set ns.new = b %}{% endif %}{% endfor %}
+            {% set ns.why = 'hard cap reached' if hard else ('room ran 4 F over setpoint for 20 min at P1' if is_state('binary_sensor.pellet_stove_energy_saving_off_overheat', 'on') else '+6 predicted >= 110 min for 2 h') %}
+          {% endif %}
+        {% elif cur in p %}
+          {% set short = last_ok and last.min < floor %}
+          {% if short or p[cur] < tgt - 5 %}
+            {% set nxt = ladder[ladder.index(cur) + 1] %}
+            {% if nxt != 'Off' or p['+6 F'] < tgt or short %}
+              {% set ns.new = nxt %}
+              {% set ns.why = ('last pause ' ~ last.min ~ ' min < ' ~ floor | int) if short else ('predicted ' ~ p[cur] | int ~ ' min < ' ~ (tgt - 5) | int) %}
+            {% endif %}
+          {% elif cur != '+2 F' and is_state('binary_sensor.pellet_stove_energy_saving_narrower_ok', 'on') and last_ok and last.min >= 110 %}
+            {% set ns.new = ladder[ladder.index(cur) - 1] %}
+            {% set ns.why = 'narrower band predicted >= 120 min for 3 h, last pause ' ~ last.min ~ ' min' %}
+          {% endif %}
+        {% endif %}
+        {{ {'cur': cur, 'new': ns.new, 'why': ns.why, 'p2': p['+2 F'], 'p4': p['+4 F'], 'p6': p['+6 F']} }}
+      hours_since: >
+        {% set t = as_timestamp(states('input_datetime.pellet_stove_last_energy_saving_change'), 0) %}
+        {{ ((now().timestamp() - t) / 3600) | round(2) }}
+    conditions:
+      - condition: state
+        entity_id: input_boolean.pellet_stove_adaptive_energy_saving
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.pellet_stove_ha_settings_priority
+        state: "on"
+      - condition: state
+        entity_id: sensor.pellet_stove_state
+        state: Running
+      - condition: template
+        value_template: "{{ decision.new != decision.cur }}"
+      - condition: template
+        value_template: "{{ hard or (hours_since >= 3 and states('counter.pellet_stove_energy_saving_changes_today') | int(0) < 4) }}"
+    actions:
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.pellet_stove_target_energy_saving_stop
+        data:
+          option: "{{ decision.new }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.pellet_stove_last_energy_saving_change
+        data:
+          timestamp: "{{ now().timestamp() }}"
+      - action: counter.increment
+        target:
+          entity_id: counter.pellet_stove_energy_saving_changes_today
+      - action: notify.notify
+        data:
+          title: "Pellet stove: Energy Saving {{ decision.cur }} -> {{ decision.new }}"
+          message: >-
+            {{ decision.why }}. Predicted pause +2/+4/+6: {{ decision.p2 | int }}/{{ decision.p4 | int }}/{{ decision.p6 | int }} min
+            at {{ states('sensor.pellet_stove_model_oat') }} F outside (local station).
+
+  - id: pellet_stove_heat_boost
+    alias: "Pellet stove: heat boost"
+    description: >-
+      Raises power one step (fan to 3 at P3, 4 at P4-P5) when the stove has run for an hour without reaching the
+      setpoint, at most one step per hour, up to the max power helper. Back to the user's targets once the setpoint has
+      held for 2 h or the stove pauses / stops. Writes input_number.pellet_stove_heat_boost; keep-settings applies it.
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: "/5"
+      - trigger: state
+        entity_id: [binary_sensor.pellet_stove_below_setpoint, binary_sensor.pellet_stove_holding_setpoint]
+        to: "on"
+      - trigger: state
+        entity_id: sensor.pellet_stove_state
+        to: [Paused, "Off"]
+    variables:
+      boost: "{{ states('input_number.pellet_stove_heat_boost') | int(0) }}"
+      eff: "{{ states('sensor.pellet_stove_effective_power_target') | int(1) }}"
+      maxp: "{{ [states('input_number.pellet_stove_max_power') | int(5), 5] | min }}"
+      mins_since: >
+        {% set t = as_timestamp(states('input_datetime.pellet_stove_last_boost_change'), 0) %}
+        {{ ((now().timestamp() - t) / 60) | round(0) }}
+    conditions:
+      - condition: state
+        entity_id: input_boolean.pellet_stove_adaptive_energy_saving
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.pellet_stove_ha_settings_priority
+        state: "on"
+    actions:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >
+                  {{ boost > 0 and (is_state('binary_sensor.pellet_stove_holding_setpoint', 'on')
+                     or states('sensor.pellet_stove_state') in ['Paused', 'Off']) }}
+            sequence:
+              - action: input_number.set_value
+                target:
+                  entity_id: input_number.pellet_stove_heat_boost
+                data:
+                  value: 0
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.pellet_stove_last_boost_change
+                data:
+                  timestamp: "{{ now().timestamp() }}"
+              - action: notify.notify
+                data:
+                  title: "Pellet stove: heat boost off"
+                  message: >-
+                    Back to P{{ states('input_number.pellet_stove_target_power') | int }}, fan {{ states('input_number.pellet_stove_target_fan') | int }}
+                    ({{ 'setpoint held 2 h' if is_state('binary_sensor.pellet_stove_holding_setpoint', 'on') else 'stove ' ~ states('sensor.pellet_stove_state') | lower }}).
+          - conditions:
+              - condition: state
+                entity_id: binary_sensor.pellet_stove_below_setpoint
+                state: "on"
+              - condition: state
+                entity_id: sensor.pellet_stove_state
+                state: Running
+              - condition: template
+                value_template: "{{ eff < maxp and mins_since >= 60 }}"
+            sequence:
+              - action: input_number.set_value
+                target:
+                  entity_id: input_number.pellet_stove_heat_boost
+                data:
+                  value: "{{ boost + 1 }}"
+              - action: input_datetime.set_datetime
+                target:
+                  entity_id: input_datetime.pellet_stove_last_boost_change
+                data:
+                  timestamp: "{{ now().timestamp() }}"
+              - action: notify.notify
+                data:
+                  title: "Pellet stove: heat boost P{{ eff + 1 }}"
+                  message: >-
+                    Running an hour without reaching {{ states('input_number.pellet_stove_target_setpoint') | int }} F
+                    (stove reads {{ states('sensor.pellet_stove_room_temperature_stove') }}, {{ states('sensor.outside_temperature') }} F outside).
+                    {% set f = states('input_number.pellet_stove_target_fan') | int(2) %}{% set q = eff + 1 %}
+                    Power P{{ eff }} -> P{{ q }}, fan {{ [f, 4 if q >= 4 else (3 if q == 3 else f)] | max }}.
+
+  - id: pellet_stove_ens_changes_reset
+    alias: "Pellet stove: reset daily Energy Saving change count"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "00:00:00"
+    actions:
+      - action: counter.reset
+        target:
+          entity_id: counter.pellet_stove_energy_saving_changes_today
