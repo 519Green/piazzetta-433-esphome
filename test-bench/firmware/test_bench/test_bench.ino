@@ -27,16 +27,28 @@
 #include <RadioLib.h>
 #include "soc/gpio_reg.h"
 
-// --- Brochage (identique au recepteur rtl_433_ESP) ---
+// --- Brochage ---
+// Decommenter pour une LilyGO T3 LoRa32 V1.6.x (SX1278 integre ; LilyGo-LoRa-Series utilities.h)
+// #define CARTE_LILYGO_T3
+#ifdef CARTE_LILYGO_T3
+#define PIN_SCK 5
+#define PIN_MISO 19
+#define PIN_MOSI 27
+#define PIN_CS 18
+#define PIN_RST 23
+#define PIN_LED 25
+#else
+// ESP32 DevKit + Ra-02 (identique au recepteur rtl_433_ESP)
 #define PIN_SCK 18
 #define PIN_MISO 19
 #define PIN_MOSI 23
 #define PIN_CS 5
 #define PIN_RST 14
+#define PIN_LED 2
+#endif
 #define PIN_DIO0 26
 #define PIN_DIO1 33
 #define PIN_DIO2 32  // donnees OOK : sortie en reception, entree en emission
-#define PIN_LED 2
 
 // --- Reglages ---
 #define FIN_TRAME_US 40000   // silence qui termine une trame : la synchro fait ~8 ms et le poele marque

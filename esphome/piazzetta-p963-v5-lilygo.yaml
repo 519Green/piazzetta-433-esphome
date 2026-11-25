@@ -1,0 +1,256 @@
+# Piazzetta P963 C pellet stove, MULTICOMFORT V5 remote (F02034130), LilyGO T3 LoRa32 V1.6.1 433 MHz.
+# Based on esphome/piazzetta-stove.yaml from https://github.com/MaximeHTL/piazzetta-433-esphome (master 2fa5c8a),
+# with the component in components/piazzetta extended for the V5 remote's key codes.
+# Secrets go in ESPHome's secrets.yaml: wifi_ssid, wifi_password, stove_api_key, stove_ota_password, stove_ap_password.
+
+esphome:
+  name: piazzetta-stove
+  friendly_name: Pellet stove
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino          # RadioLib is used through the Arduino framework
+
+logger:
+  level: DEBUG             # logs every decoded frame in hex
+
+api:
+  encryption:
+    key: !secret stove_api_key
+  # Do not reboot when Home Assistant is away (see upstream docs/esphome.md)
+  reboot_timeout: 0s
+  actions:
+    # Press stove keys from HA without flashing (2026-11-19). Bounded in the component: power-family keys
+    # (key & 0x1F == 0x01) refused, one command at a time, 1-20 keys, gap clamped 150-3000 ms, needs Transmit on.
+    # Example keys: 0x84 = 132 (fan menu), 0x98 = 152 (power menu), 0x88 = 136 (+), 0x8C = 140 (-), 0x90 = 144 (ESC).
+    # door: true sends byte 3 = 0x80 (remote's flap open): then 0x84 = MENU, 0x98 = SET, 0x90 = ESC, 0x8A = OPT.
+    - action: press_keys
+      variables:
+        keys: int[]
+        gap_ms: int
+        door: bool
+      then:
+        - lambda: |-
+            std::vector<int32_t> v(keys.begin(), keys.end());
+            id(stove).appuyer_touches(v, gap_ms, door);
+
+ota:
+  - platform: esphome
+    password: !secret stove_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none    # keep Wi-Fi awake; bursts may disturb 433 MHz reception
+  ap:
+    ssid: "Piazzetta-Stove-Fallback"
+    password: !secret stove_ap_password
+
+captive_portal:
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [piazzetta]
+
+piazzetta:
+  id: stove
+  remote_id: 0xC5            # read from our remote 2026-10-29: use your own remote's id
+  # MULTICOMFORT V5 codes captured 2026-10-29 (stove out of range): poll 80, power held A1.
+  touche_interrogation: 0x80
+  touche_maintien: 0xA1        # unused while sequence_maintien is set; A1 did NOT work (2026-11-19 20:09)
+  # Real V5 long press captured 2026-11-19 20:11 (stove started): 81, then key 21 21 41 61 61 61 61 61,
+  # byte-2 bit 7 = C0 C0 40 40 C0 40 40 C0 (BE = bit 7 set, 3E = clear). Two extra 61 frames for margin.
+  sequence_maintien:
+    - {touche: 0x21, etat: 0xBE}
+    - {touche: 0x21, etat: 0xBE}
+    - {touche: 0x41, etat: 0x3E}
+    - {touche: 0x61, etat: 0x3E}
+    - {touche: 0x61, etat: 0xBE}
+    - {touche: 0x61, etat: 0x3E}
+    - {touche: 0x61, etat: 0x3E}
+    - {touche: 0x61, etat: 0xBE}
+    - {touche: 0x61, etat: 0x3E}
+    - {touche: 0x61, etat: 0x3E}
+  periode_maintien: 450ms      # remote averaged ~430 ms; 350 ms would overlap the stove's full-screen reply
+  # V5 second byte is a counter; copy the last value heard from the real remote. Unverified on the stove.
+  copier_octet_etat: true
+  # Unused while the "Transmit" switch below exists: the switch sets the mode at boot and at runtime from HA.
+  ecoute_seule: true
+  frequence: 433.92
+  puissance_emission: 17     # was 10; stove did not answer polls at 10 dBm (2026-11-19 20:06)
+  seuil_rssi: -78
+  intervalle_interrogation: 30s
+  # LilyGO T3 V1.6.x pins (LilyGo-LoRa-Series utilities.h)
+  pin_sck: 5
+  pin_miso: 19
+  pin_mosi: 27
+  pin_cs: 18
+  pin_rst: 23
+  pin_dio0: 26
+  pin_dio1: 33
+  pin_dio2: 32
+
+  # Temperature on the stove's screen: its own probe, behind the stove near a cold outside wall (2026-11-19)
+  temperature:
+    name: "Room temperature (stove)"
+    unit_of_measurement: "°F"
+  # Raw low 7 bits of the real remote's byte 2. Remote hangs next to the Ground Floor Stelpro; on 2026-11-19 it
+  # read 52 while the Stelpro read 61, so this is NOT yet known to be degrees F. Compare histories before trusting.
+  temperature_telecommande:
+    name: "Remote raw byte"
+  # From the STOVE STATUS screen, refreshed when the HA script opens it
+  temperature_fumees:
+    name: "Exhaust temperature"
+    unit_of_measurement: "°F"
+  rpm_fumees:
+    name: "Exhaust fan speed"
+  vis:
+    name: "Auger feed"
+  phase:
+    name: "Phase"
+  etat:
+    name: "State"
+  ecran_ligne1:
+    name: "Screen line 1"
+  ecran_ligne2:
+    name: "Screen line 2"
+  ecran_bas:
+    name: "Screen bottom"
+  derniere_trame:
+    name: "Last frame"
+    id: last_frame
+  heure:
+    name: "Stove clock"
+  rssi:
+    name: "Stove radio signal"
+  joignable:
+    name: "Stove reachable"
+  bascule_en_attente:
+    name: "On-off pending confirmation"
+  age_ecran:
+    name: "Screen age"
+  trames_rejetees:
+    name: "Rejected frames"
+  trames_corrigees:
+    name: "Corrected frames"
+  puissance:
+    name: "Power"
+  ventilateur:
+    name: "Fan"
+  # Room setpoint (SET ROOM TEMPERAT.); state comes only from that screen. HA keeps it at its target
+  # (automation "Pellet stove: keep HA settings", 2026-11-23)
+  consigne:
+    name: "Setpoint"
+    unit_of_measurement: "°F"
+    mode: box
+  # Set values seen on the SET POWER / SET VENT screens (remote or HA); "Power"/"Fan" above follow the live level
+  puissance_reglee:
+    name: "Power setting"
+  ventilateur_regle:
+    name: "Fan setting"
+  # MENU > ENERGY SAVING > STOP / START, degrees F above / below the setpoint (2026-11-23)
+  ens_stop:
+    name: "Energy Saving stop"
+  ens_start:
+    name: "Energy Saving start"
+  interroger:
+    name: "Poll stove"
+  marche_arret:
+    name: "On-off"             # TOGGLE (long press on power); untested on V5
+  # Transmit: ON by default, remembers a manual OFF across reboots (2026-11-19). Auto sync: OFF after
+  # every reboot until verified on V5. Turning Transmit off mid-command blocks the rest of the command.
+  emission:
+    name: "Transmit"
+    id: transmit
+    restore_mode: RESTORE_DEFAULT_ON
+  synchro_auto:
+    name: "Auto sync"          # automatic 0x84 key press; on V5 0x84 is MENU, verify at the stove first
+
+# Tunable from HA without flashing; values are saved on the board (restore_value). on_value also runs at boot
+# with the restored value, so the component always gets them. Copy settled values back into initial_value.
+number:
+  - platform: template
+    name: "Key delay"
+    id: key_delay
+    entity_category: config
+    icon: mdi:timer-sand
+    unit_of_measurement: ms
+    min_value: 0
+    max_value: 1000
+    step: 10
+    initial_value: 150
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stove).set_delai_touche((uint32_t) x);
+  - platform: template
+    name: "Long-press gap"
+    id: long_press_gap
+    entity_category: config
+    icon: mdi:timer-outline
+    unit_of_measurement: ms
+    min_value: 200
+    max_value: 1000
+    step: 10
+    initial_value: 450
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stove).set_periode_maintien((uint32_t) x);
+
+text:
+  - platform: template
+    name: "On-off sequence"
+    id: onoff_sequence
+    entity_category: config
+    icon: mdi:power
+    mode: text
+    max_length: 120
+    # hold frames after the 0x81 press; * = byte-2 bit 7 set. Captured from the real remote 2026-11-19.
+    initial_value: "21* 21* 41 61 61* 61 61 61* 61 61"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: id(stove).regler_sequence_maintien(x);
+
+sensor:
+  - platform: wifi_signal
+    name: "Wi-Fi signal"
+    id: wifi_dbm
+    update_interval: 60s
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP address"
+      id: ip_addr
+
+# On-board SSD1306 128x64 OLED (LilyGO T3 V1.6.x: I2C SDA 21, SCL 22, no reset pin)
+i2c:
+  sda: 21
+  scl: 22
+
+font:
+  - file: "gfonts://Roboto Mono"
+    id: small
+    size: 10
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: 2s
+    lambda: |-
+      // Title shows the live mode from the Transmit switch
+      it.print(0, 0, id(small), id(transmit).state ? "Piazzetta  TX ON" : "Piazzetta  LISTEN");
+      it.printf(0, 12, id(small), "IP %s", id(ip_addr).state.c_str());
+      if (id(wifi_dbm).has_state())
+        it.printf(0, 24, id(small), "WiFi %.0f dBm", id(wifi_dbm).state);
+      // Last frame "[rssi] hex": 21 characters per line, two lines; longer stove screens are cut (full text in HA)
+      const std::string &f = id(last_frame).state;
+      it.printf(0, 36, id(small), "%.21s", f.c_str());
+      if (f.size() > 21)
+        it.printf(0, 48, id(small), "%.21s", f.c_str() + 21);

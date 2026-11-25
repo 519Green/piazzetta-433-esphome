@@ -10,3 +10,5 @@ secrets.yaml
 __pycache__/
 # Captures with personal data
 *.local.*
+# Third-party manuals and parameter sheets (copyrighted, not redistributed)
+docs/*.pdf
