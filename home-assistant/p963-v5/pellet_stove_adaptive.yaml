@@ -8,7 +8,10 @@
 #   K = STOP_F + START_F - 3 (raw counts the room falls; START fixed at -2 F, so K = STOP - 1)
 #   Tmid = middle of the stove-display band = setpoint + STOP/2 - 1
 #   OAT = mean of local station now and the local station forecast for the next 3 hours
-#   c = median(measured / predicted) over the last 5 clean pauses, clamped 0.75-1.3
+#   c = exp(min(0, EWMA alpha 0.5 of log(measured / raw) over the last 6 clean, non-transient pauses)), floor 0.6
+#     (2026-11-24: c only shortens predictions. The old median-of-5 rule learned from long pauses after the
+#     70 -> 66 setpoint drop, reached 1.8 and picked +2 F -> 83-min pause. Backtest of 23 pauses in the plan file.)
+#   transient pause = setpoint differs by >= 1 F from its 18-h moving average (stored building heat after a change)
 # t0 and A are input_numbers so they can be refitted without editing this file.
 
 template:
@@ -53,17 +56,30 @@ template:
         entity_id: climate.room_thermostat
         attribute: current_temperature
       - trigger: state
-        entity_id: [number.pellet_stove_power, number.pellet_stove_fan]
+        entity_id: [number.pellet_stove_power, number.pellet_stove_fan, number.pellet_stove_setpoint]
         not_to: [unknown, unavailable]
       - trigger: time_pattern
         minutes: "/30"
+      - trigger: event
+        event_type: esphome.piazzetta_remote_key
     variables:
       n: >
-        {% set a = this.attributes if this is defined and this.attributes is defined else {} %}
+        {# `this` is not available in a trigger block's variables: read the entity's own state (2026-11-23) #}
+        {% set a = states.sensor.pellet_stove_cycle_log.attributes if states.sensor.pellet_stove_cycle_log is not none else {} %}
         {% set ts = now().timestamp() | int %}
         {% set st = states('sensor.pellet_stove_state') %}
-        {% set seg_new = 'burn' if st in ['Ignition', 'Running', 'Cleaning'] else ('pause' if st == 'Paused' else 'idle') %}
         {% set seg = a.get('seg', 'idle') %}
+        {# A restart of the board or HA makes the state unknown/unavailable for a moment: keep the segment (2026-11-24,
+           the 16:08 and 18:48 flashes each split a pause in two) #}
+        {% set seg_new = seg if st in ['unknown', 'unavailable', ''] else
+                         ('burn' if st in ['Ignition', 'Running', 'Cleaning'] else ('pause' if st == 'Paused' else 'idle')) %}
+        {# Fix 3: a power press on the real remote (event) or HA's on/off button within 5 min of a segment end makes
+           that end manual: the record is kept but not learned from #}
+        {% set rk_now = trigger is defined and trigger.platform == 'event' and trigger.event.data.get('key') == 'Power (on/off)' %}
+        {% set rk_ts = ts if rk_now else a.get('rk_ts', 0) | int(0) %}
+        {% set btn_ts = as_timestamp(states('button.pellet_stove_on_off'), 0) | int(0) %}
+        {% set man_ts = [rk_ts, btn_ts] | max %}
+        {% set manual = man_ts > 0 and (ts - man_ts) | abs < 300 %}
         {% set stove = states('sensor.pellet_stove_room_temperature_stove') | float(0) %}
         {% set stel = state_attr('climate.room_thermostat', 'current_temperature') | float(0) %}
         {% set oat = states('sensor.outside_temperature') | float(0) %}
@@ -71,6 +87,12 @@ template:
         {% set lvl = states('number.pellet_stove_power') | int(0) %}
         {% set fan = states('number.pellet_stove_fan') | int(0) %}
         {% set dt = [ts - (a.get('last_ts', ts) | int), 0] | max %}
+        {# Setpoint memory (2026-11-24): 18-h moving average of the stove setpoint; |setpoint - sp_ema| >= 1 F = transient #}
+        {% set spn = states('number.pellet_stove_setpoint') | float(states('input_number.pellet_stove_target_setpoint') | float(66)) %}
+        {% set sp_held = a.get('sp_last', spn) | float(spn) %}
+        {% set sp_ema = (sp_held + (a.get('sp_ema', sp_held) | float(sp_held) - sp_held) * e ** (-dt / 64800)) | round(2) %}
+        {% set trans_now = (spn - sp_ema) | abs >= 1 %}
+        {% set s_trans = a.get('s_trans') in [true, 'True', 'true'] %}
         {% set pl = a.get('plev', 0) | int %}
         {% set fl = a.get('pfan', 0) | int %}
         {% set opt = a.get('pt', [0, 0, 0, 0, 0]) %}
@@ -94,7 +116,7 @@ template:
                         'oat': ((a.get('s_oat', oat) | float(oat) + oat) / 2) | round(1),
                         'stove': [a.get('s_stove'), stove], 'stelpro': [smin, smax],
                         'pred_raw': a.get('s_pred_raw'), 'pred': a.get('s_pred'),
-                        'clean': st == 'Ignition'} %}
+                        'clean': st == 'Ignition' and not manual, 'manual': manual, 'transient': s_trans} %}
           {% set o.pauses = (o.pauses + [rec])[-12:] %}
         {% elif seg_new != seg and seg == 'burn' %}
           {% set to_ok = ((o.ok_ts - s_ts) / 60) | round(0) if o.ok_ts is not none else none %}
@@ -102,30 +124,64 @@ template:
                         if o.ok_ts is not none and o.ok_ts > s_ts + 300 else none %}
           {% set rec = {'end': endtxt, 'end_ts': ts, 'min': ((ts - s_ts) / 60) | round(0), 'to_ok': to_ok,
                         'stove': [a.get('s_stove'), o.ok_stove, stove], 'stelpro': [a.get('s_stel'), smin, smax],
-                        'rate_f_h': rate, 'p_min': q.pt | map('multiply', 1 / 60) | map('round', 0) | list,
+                        'rate_f_h': rate,
+                        'rise_f_h': ((stove - (a.get('s_stove', 0) | float(0))) / ((ts - s_ts) / 3600)) | round(2) if ts > s_ts + 600 else none,
+                        'stelpro_rise_f_h': ((smax - (a.get('s_stel', 0) | float(0))) / ((ts - s_ts) / 3600)) | round(2) if ts > s_ts + 600 and stel > 0 else none,
+                        'p_min': q.pt | map('multiply', 1 / 60) | map('round', 0) | list,
                         'fan_min': q.ft | map('multiply', 1 / 60) | map('round', 0) | list,
                         'oat': ((a.get('s_oat', oat) | float(oat) + oat) / 2) | round(1), 'sp': a.get('s_sp'),
-                        'band': a.get('s_band'), 'ended': st} %}
+                        'band': a.get('s_band'), 'ended': st, 'manual': manual, 'transient': s_trans} %}
           {% set o.burns = (o.burns + [rec])[-12:] %}
         {% endif %}
-        {% set clean = o.pauses | selectattr('clean') | selectattr('pred_raw', 'number') | list %}
-        {% set r = namespace(v=[]) %}
-        {% for p in clean[-5:] %}{% if p.pred_raw > 0 %}{% set r.v = r.v + [p.min / p.pred_raw] %}{% endif %}{% endfor %}
-        {% set rv = r.v | sort %}
-        {% set med = (rv[(rv | count) // 2] if rv | count % 2 == 1 else (rv[(rv | count) // 2 - 1] + rv[(rv | count) // 2]) / 2) if rv | count > 0 else 1 %}
-        {% set corr = ([[med, 0.75] | max, 1.3] | min) | round(3) %}
+        {# The power event can arrive just after the state change that closed the record: flag it now #}
+        {% if rk_now and o.pauses | count > 0 and ts - (o.pauses[-1].end_ts | int(0)) < 300 %}
+          {% set o.pauses = o.pauses[:-1] + [dict(o.pauses[-1], clean=false, manual=true)] %}
+        {% endif %}
+        {% if rk_now and o.burns | count > 0 and ts - (o.burns[-1].end_ts | int(0)) < 300 %}
+          {% set o.burns = o.burns[:-1] + [dict(o.burns[-1], manual=true)] %}
+        {% endif %}
+        {# Merge a pause split by a restart (previous record not clean, next one starting within 3 min of its end) #}
+        {% set mg = namespace(l=[]) %}
+        {% for p in o.pauses %}
+          {% set prev = mg.l[-1] if mg.l | count > 0 else none %}
+          {% set p_start = (p.end_ts | int(0)) - ((p.min | float(0)) * 60) | int %}
+          {% if prev is not none and not prev.get('clean') and (p_start - (prev.end_ts | int(0))) | abs < 180 %}
+            {% set ps, cs = prev.get('stelpro') or [0, 0], p.get('stelpro') or [0, 0] %}
+            {% set mg.l = mg.l[:-1] + [dict(p, start=prev.start, min=(prev.min | float(0)) + (p.min | float(0)),
+                band=prev.band, sp=prev.sp, oat=(((prev.oat | float(0)) + (p.oat | float(0))) / 2) | round(1),
+                stove=[(prev.get('stove') or [none])[0], (p.get('stove') or [none])[-1]],
+                stelpro=[[ps[0], cs[0]] | min, [ps[-1], cs[-1]] | max], pred_raw=prev.pred_raw, pred=prev.pred,
+                transient=prev.get('transient', false), manual=prev.get('manual', false) or p.get('manual', false),
+                merged=true)] %}
+          {% else %}
+            {% set mg.l = mg.l + [p] %}
+          {% endif %}
+        {% endfor %}
+        {# 2026-11-24 16:44 relight and 19:40 shutdown came from the remote's power key, before key presses were logged #}
+        {% set fx = namespace(l=[]) %}
+        {% for p in mg.l %}
+          {% set fx.l = fx.l + [dict(p, clean=false, manual=true) if (p.end_ts | int(0)) in [1795556663, 1795567239] else p] %}
+        {% endfor %}
+        {% set o.pauses = fx.l %}
+        {# Correction (2026-11-24): EWMA (alpha 0.5) of log(measured / raw) over the last 6 clean, non-transient pauses.
+           Capped at 1: long pauses are the safe side; learning from them made the mode narrow into short pauses. #}
+        {% set r = namespace(sel=[], v=0, n=0) %}
+        {% for p in o.pauses %}{% if p.get('clean') and not p.get('transient', false) and p.get('pred_raw') is number and p.get('pred_raw') > 0 and p.get('min', 0) | float(0) > 0 %}{% set r.sel = r.sel + [p] %}{% endif %}{% endfor %}
+        {% for p in r.sel[-6:] %}{% set r.v = 0.5 * r.v + 0.5 * ((p.min / p.pred_raw) | log) %}{% set r.n = r.n + 1 %}{% endfor %}
+        {% set corr = [e ** ([r.v, 0] | min), 0.6] | max | round(3) %}
         {% set out = {'seg': seg_new, 'last_ts': ts, 'plev': lvl, 'pfan': fan,
-                      'pauses': o.pauses, 'burns': o.burns, 'correction': corr, 'n_ratio': rv | count} %}
+                      'pauses': o.pauses, 'burns': o.burns, 'correction': corr, 'n_ratio': r.n, 'ewma_log': r.v | round(3),
+                      'sp_ema': sp_ema, 'sp_last': spn, 'transient_now': trans_now, 'rk_ts': rk_ts} %}
         {% if seg_new != seg %}
           {% set out = dict(out, s_ts=ts, s_start=endtxt, s_stove=stove, s_stel=stel, s_oat=oat,
                             s_band=(states('select.pellet_stove_energy_saving_stop') if states('select.pellet_stove_energy_saving_stop') in ['Off', '+2 F', '+4 F', '+6 F'] else states('input_select.pellet_stove_target_energy_saving_stop')),
-                            s_sp=states('input_number.pellet_stove_target_setpoint') | float(0),
+                            s_sp=states('input_number.pellet_stove_target_setpoint') | float(0), s_trans=trans_now,
                             s_pred=states('sensor.pellet_stove_predicted_pause') | float(none),
                             s_pred_raw=state_attr('sensor.pellet_stove_predicted_pause', 'raw') | float(none),
                             smin=stel, smax=stel, ok_ts=none, ok_stove=none, pt=[0, 0, 0, 0, 0], ft=[0, 0, 0, 0, 0]) %}
         {% else %}
           {% set out = dict(out, s_ts=s_ts, s_start=a.get('s_start'), s_stove=a.get('s_stove'), s_stel=a.get('s_stel'),
-                            s_oat=a.get('s_oat'), s_band=a.get('s_band'), s_sp=a.get('s_sp'), s_pred=a.get('s_pred'),
+                            s_oat=a.get('s_oat'), s_band=a.get('s_band'), s_sp=a.get('s_sp'), s_trans=s_trans, s_pred=a.get('s_pred'),
                             s_pred_raw=a.get('s_pred_raw'), smin=smin, smax=smax, ok_ts=o.ok_ts, ok_stove=o.ok_stove,
                             pt=q.pt, ft=q.ft) %}
         {% endif %}
@@ -159,6 +215,12 @@ template:
           burns: "{{ n.burns }}"
           correction: "{{ n.correction }}"
           n_ratio: "{{ n.n_ratio }}"
+          ewma_log: "{{ n.ewma_log }}"
+          sp_ema: "{{ n.sp_ema }}"
+          sp_last: "{{ n.sp_last }}"
+          transient_now: "{{ n.transient_now }}"
+          s_trans: "{{ n.s_trans }}"
+          rk_ts: "{{ n.rk_ts }}"
 
   # --- Model outputs and log views
   - sensor:
@@ -276,6 +338,7 @@ template:
           band: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].band if p | count > 0 else none }}"
           oat: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].oat if p | count > 0 else none }}"
           clean: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].clean if p | count > 0 else none }}"
+          transient: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].get('transient', false) if p | count > 0 else none }}"
           ended: "{% set p = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}{{ p[-1].end if p | count > 0 else none }}"
       - name: Pellet stove last pause predicted
         unique_id: pellet_stove_last_pause_predicted
@@ -290,6 +353,11 @@ template:
         state_class: measurement
         icon: mdi:tune-variant
         state: "{{ state_attr('sensor.pellet_stove_cycle_log', 'correction') | float(1) }}"
+        attributes:
+          rule: "exp(min(0, EWMA 0.5 of log(measured/raw) over the last 6 clean non-transient pauses)), floor 0.6"
+          pauses_used: "{{ state_attr('sensor.pellet_stove_cycle_log', 'n_ratio') }}"
+          setpoint_average_18h: "{{ state_attr('sensor.pellet_stove_cycle_log', 'sp_ema') }}"
+          transient_now: "{{ state_attr('sensor.pellet_stove_cycle_log', 'transient_now') }}"
       - name: Pellet stove last burn time to setpoint
         unique_id: pellet_stove_last_burn_to_setpoint
         unit_of_measurement: min
@@ -309,7 +377,12 @@ template:
         icon: mdi:thermometer-plus
         state: >
           {% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}
-          {{ b[-1].rate_f_h if b | count > 0 and b[-1].rate_f_h is number else none }}
+          {# Rise over the whole burn (start -> stop): "OK" comes ~15 min after relight, so time-to-OK is not a recovery measure #}
+          {{ b[-1].rise_f_h if b | count > 0 and b[-1].rise_f_h is number else none }}
+        attributes:
+          stelpro_rise_f_h: "{% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}{{ b[-1].stelpro_rise_f_h if b | count > 0 else none }}"
+          power_minutes_p1_p5: "{% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}{{ b[-1].p_min if b | count > 0 else none }}"
+          oat: "{% set b = state_attr('sensor.pellet_stove_cycle_log', 'burns') or [] %}{{ b[-1].oat if b | count > 0 else none }}"
       # Swing of the ground-floor Stelpro over the last full cycle (burn + following pause): the comfort metric
       - name: Pellet stove cycle swing
         unique_id: pellet_stove_cycle_swing
@@ -373,7 +446,7 @@ template:
           {% set m = {'+4 F': '2', '+6 F': '4'} %}
           {{ cur in m and states('sensor.pellet_stove_predicted_pause_' ~ m[cur]) | float(0) >= 120 }}
         delay_on:
-          hours: 3
+          hours: 1
       - name: Pellet stove Energy Saving widest ok
         unique_id: pellet_stove_ens_widest_ok
         icon: mdi:arrow-expand-vertical
@@ -386,7 +459,9 @@ automation:
     alias: "Pellet stove: adaptive Energy Saving"
     description: >-
       Picks the Energy Saving STOP band (+2 -> +4 -> +6 -> Off, START -2) with the smallest swing whose predicted pause
-      is >= the pause target (100 min), widening after a measured pause under the floor (90 min). Off only when +6 is
+      is >= the pause target (100 min), widening after a measured pause under the floor (90 min); narrowing after a
+      measured pause >= 1.5 x target, or when the narrower band predicts >= 120 for 1 h (2026-11-23); never narrowing on a
+      transient pause (setpoint changed within about a day, 2026-11-24). Off only when +6 is
       predicted short or measured short; back on when the room overheats at P1, +6 predicts >= 110 for 2 h, or the hard
       cap (stove reading >= setpoint+7 or Stelpro >= 73). >= 3 h between changes (hard cap excepted), max 4 a day.
       Writes input_select.pellet_stove_target_energy_saving_stop; "Pellet stove: keep HA settings" applies it.
@@ -420,7 +495,9 @@ automation:
         {% set floor = states('input_number.pellet_stove_pause_floor') | float(90) %}
         {% set log = state_attr('sensor.pellet_stove_cycle_log', 'pauses') or [] %}
         {% set last = log[-1] if log | count > 0 else none %}
-        {% set last_ok = last is not none and last.clean and last.band == cur and now().timestamp() - (last.end_ts | float(0)) < 8 * 3600 %}
+        {% set last_any = last is not none and last.clean and last.band == cur and now().timestamp() - (last.end_ts | float(0)) < 8 * 3600 %}
+        {# A pause soon after a setpoint change runs long on stored heat: it may widen the band, never narrow it (2026-11-24) #}
+        {% set last_ok = last_any and not last.get('transient', false) %}
         {% set ladder = ['+2 F', '+4 F', '+6 F', 'Off'] %}
         {% set ns = namespace(new=cur, why='') %}
         {% if cur == 'Off' %}
@@ -430,16 +507,19 @@ automation:
             {% set ns.why = 'hard cap reached' if hard else ('room ran 4 F over setpoint for 20 min at P1' if is_state('binary_sensor.pellet_stove_energy_saving_off_overheat', 'on') else '+6 predicted >= 110 min for 2 h') %}
           {% endif %}
         {% elif cur in p %}
-          {% set short = last_ok and last.min < floor %}
+          {% set short = last_any and last.min < floor %}
           {% if short or p[cur] < tgt - 5 %}
             {% set nxt = ladder[ladder.index(cur) + 1] %}
             {% if nxt != 'Off' or p['+6 F'] < tgt or short %}
               {% set ns.new = nxt %}
               {% set ns.why = ('last pause ' ~ last.min ~ ' min < ' ~ floor | int) if short else ('predicted ' ~ p[cur] | int ~ ' min < ' ~ (tgt - 5) | int) %}
             {% endif %}
+          {% elif cur != '+2 F' and last_ok and last.min >= 1.5 * tgt %}
+            {% set ns.new = ladder[ladder.index(cur) - 1] %}
+            {% set ns.why = 'last pause ' ~ last.min | int ~ ' min >= 1.5 x target ' ~ tgt | int %}
           {% elif cur != '+2 F' and is_state('binary_sensor.pellet_stove_energy_saving_narrower_ok', 'on') and last_ok and last.min >= 110 %}
             {% set ns.new = ladder[ladder.index(cur) - 1] %}
-            {% set ns.why = 'narrower band predicted >= 120 min for 3 h, last pause ' ~ last.min ~ ' min' %}
+            {% set ns.why = 'narrower band predicted >= 120 min for 1 h, last pause ' ~ last.min | int ~ ' min' %}
           {% endif %}
         {% endif %}
         {{ {'cur': cur, 'new': ns.new, 'why': ns.why, 'p2': p['+2 F'], 'p4': p['+4 F'], 'p6': p['+6 F']} }}
@@ -575,3 +655,83 @@ automation:
       - action: counter.reset
         target:
           entity_id: counter.pellet_stove_energy_saving_changes_today
+
+  # Remote key log (2026-11-24): the board fires esphome.piazzetta_remote_key once per press on the real remote.
+  # Every press goes to the logbook (attached to the Phase sensor, so it shows in the phase history); a power press also notifies (it switches the stove on or off).
+  - id: pellet_stove_remote_key_log
+    alias: "Pellet stove: log remote key presses"
+    mode: queued
+    max: 20
+    triggers:
+      - trigger: event
+        event_type: esphome.piazzetta_remote_key
+    actions:
+      - action: logbook.log
+        data:
+          name: "Pellet stove remote"
+          entity_id: sensor.pellet_stove_phase
+          message: "{{ trigger.event.data.key }} (stove: {{ states('sensor.pellet_stove_phase') }})"
+      - if:
+          - condition: template
+            value_template: "{{ trigger.event.data.key == 'Power (on/off)' }}"
+        then:
+          - action: notify.notify
+            data:
+              title: "Pellet stove: power pressed on the remote"
+              message: >-
+                The remote's power key was pressed at {{ now().strftime('%H:%M') }} while the stove showed
+                {{ states('sensor.pellet_stove_phase') }}. It will switch on or off; HA does not override this.
+
+  # Stove alerts (2026-11-24): fault screen, failed ignition, board out of reach, frozen screen, and the stove left
+  # off while the room is well below the HA setpoint (for example switched off by the remote by mistake).
+  - id: pellet_stove_alerts
+    alias: "Pellet stove: alerts"
+    mode: queued
+    max: 10
+    triggers:
+      - trigger: state
+        entity_id: sensor.pellet_stove_state
+        to: "Fault"
+        id: fault
+      - trigger: state
+        entity_id: sensor.pellet_stove_state
+        to: "Ignition"
+        for: "00:30:00"
+        id: ignition
+      - trigger: state
+        entity_id: binary_sensor.pellet_stove_stove_reachable
+        to: "off"
+        for: "00:15:00"
+        id: unreachable
+      - trigger: numeric_state
+        entity_id: sensor.pellet_stove_screen_age
+        above: 3600
+        for: "00:05:00"
+        id: frozen
+      - trigger: template
+        value_template: >-
+          {{ is_state('sensor.pellet_stove_state', 'Off')
+             and states('sensor.pellet_stove_room_temperature_stove') | float(99)
+                 <= states('input_number.pellet_stove_target_setpoint') | float(0) - 3 }}
+        for: "00:30:00"
+        id: off_cold
+    actions:
+      - variables:
+          what: >-
+            {{ {'fault': 'shows a fault',
+                'ignition': 'has been igniting for 30 min (failed light?)',
+                'unreachable': 'board has not heard the stove for 15 min',
+                'frozen': 'screen has not updated for over an hour',
+                'off_cold': 'is Off and the room is 3 F or more below the setpoint'}[trigger.id] }}
+      - action: logbook.log
+        data:
+          name: "Pellet stove alert"
+          entity_id: sensor.pellet_stove_phase
+          message: "{{ what }} ({{ states('sensor.pellet_stove_phase') }})"
+      - action: notify.notify
+        data:
+          title: "Pellet stove: {{ what }}"
+          message: >-
+            {{ now().strftime('%H:%M') }}: screen "{{ states('sensor.pellet_stove_phase') }}",
+            stove reads {{ states('sensor.pellet_stove_room_temperature_stove') }} F,
+            setpoint {{ states('input_number.pellet_stove_target_setpoint') | int(0) }} F.

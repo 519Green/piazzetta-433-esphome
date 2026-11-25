@@ -12,6 +12,8 @@ cfg = {
   "mode": "single",
   "sequence": [
     {"condition": "state", "entity_id": "switch.pellet_stove_transmit", "state": "on"},
+    # No menu keys while the stove is lighting (2026-11-20: reads at 16:00 and 18:00 landed in ignition PHASE II)
+    {"condition": "not", "conditions": [{"condition": "state", "entity_id": "sensor.pellet_stove_state", "state": "Ignition"}]},
     {"repeat": {"sequence": [
         press("{{ [[164,128,128],[4,128,128],[164,128,128]][repeat.index - 1] }}"),
         {"wait_template": "{{ is_state('%s','SELECT') }}" % L1, "timeout": 8, "continue_on_timeout": True}],

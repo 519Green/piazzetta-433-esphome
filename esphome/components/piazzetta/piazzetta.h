@@ -10,6 +10,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/button/button.h"
 #include "esphome/components/number/number.h"
@@ -129,6 +130,7 @@ class PiazzettaComponent : public Component {
   void set_ligne2(text_sensor::TextSensor *t) { ligne2_ = t; }
   void set_bas(text_sensor::TextSensor *t) { bas_ = t; }
   void set_derniere_trame(text_sensor::TextSensor *t) { derniere_trame_ = t; }
+  void set_touche_telecommande(text_sensor::TextSensor *t) { touche_telecommande_ = t; }
   void set_joignable(binary_sensor::BinarySensor *b) { joignable_ = b; }
   void set_puissance(PiazzettaNumber *n) { puissance_ = n; }
   void set_ventilateur(PiazzettaNumber *n) { ventilateur_ = n; }
@@ -220,6 +222,12 @@ class PiazzettaComponent : public Component {
   text_sensor::TextSensor *ligne2_{nullptr};
   text_sensor::TextSensor *bas_{nullptr};
   text_sensor::TextSensor *derniere_trame_{nullptr};
+  text_sensor::TextSensor *touche_telecommande_{nullptr};
+  // Touches de la vraie telecommande : une valeur par appui (les repetitions d'un appui sont ignorees)
+  void signaler_touche_(const std::vector<uint8_t> &o);
+  uint8_t derniere_touche_entendue_{0};
+  uint32_t derniere_touche_ms_{0};
+  uint32_t dernier_marche_entendu_ms_{0};
   binary_sensor::BinarySensor *joignable_{nullptr};
   PiazzettaNumber *puissance_{nullptr};
   PiazzettaNumber *ventilateur_{nullptr};
@@ -289,6 +297,10 @@ class PiazzettaComponent : public Component {
   bool ens_attente_{false};   // une touche est partie, on attend son ecran
   std::vector<uint8_t> ens_trame_;  // derniere trame envoyee (renvoyee telle quelle si pas d'ecran)
   int ens_stop_vu_{-1}, ens_start_vu_{-1};
+  // Dernieres valeurs Energy Saving vues, gardees en flash : republiees au demarrage au lieu de « unknown »
+  ESPPreferenceObject pref_ens_;
+  uint16_t ens_sauve_{0xFFFF};
+  void sauver_ens_();
   // Le poele ignore une touche identique a la precedente (compteur compris) : compteur 1-3 en bits 5-6,
   // change a chaque touche de reglage comme la vraie telecommande (A8/C8/E8 ...). Constate 2026-11-20/23.
   // Pas toujours : le 2026-11-24 18:20, des renvois identiques de + ont agi (voir la marche Energy Saving).

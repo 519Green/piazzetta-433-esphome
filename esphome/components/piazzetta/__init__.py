@@ -50,6 +50,7 @@ CONF_PERIODE_MAINTIEN = "periode_maintien"
 CONF_COPIER_OCTET_ETAT = "copier_octet_etat"
 CONF_ECOUTE_SEULE = "ecoute_seule"
 CONF_DERNIERE_TRAME = "derniere_trame"
+CONF_TOUCHE_TELECOMMANDE = "touche_telecommande"
 CONF_PUISSANCE_EMISSION = "puissance_emission"
 CONF_SEUIL_RSSI = "seuil_rssi"
 CONF_INTERVALLE = "intervalle_interrogation"
@@ -147,6 +148,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_HEURE): text_sensor.text_sensor_schema(
             icon="mdi:clock-outline", entity_category=ENTITY_CATEGORY_DIAGNOSTIC
         ),
+        # Key pressed on the real remote (decoded name, one value per press; polls ignored)
+        cv.Optional(CONF_TOUCHE_TELECOMMANDE): text_sensor.text_sensor_schema(icon="mdi:remote"),
         cv.Optional(CONF_JOIGNABLE): binary_sensor.binary_sensor_schema(
             device_class=DEVICE_CLASS_CONNECTIVITY,
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
@@ -256,6 +259,7 @@ async def to_code(config):
         (CONF_LIGNE2, "set_ligne2"),
         (CONF_BAS, "set_bas"),
         (CONF_DERNIERE_TRAME, "set_derniere_trame"),
+        (CONF_TOUCHE_TELECOMMANDE, "set_touche_telecommande"),
     ):
         if cle in config:
             cg.add(getattr(var, setter)(await text_sensor.new_text_sensor(config[cle])))

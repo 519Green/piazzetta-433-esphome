@@ -43,7 +43,14 @@ class PiazzettaLcdCard extends HTMLElement {
     $("l2").textContent = val("sensor", "screen_line_2");
     $("bt").textContent = val("sensor", "screen_bottom");
     const age = parseFloat(val("sensor", "screen_age"));
-    $("age").textContent = isNaN(age) ? "" : `screen ${Math.round(age)} s old`;
+    // Last key pressed on the real remote (sensor Remote key), with how long ago
+    const rk = this.st_("sensor", "remote_key"), rkv = val("sensor", "remote_key");
+    let rks = "";
+    if (rkv && rk?.last_changed) {
+      const m = Math.round((Date.now() - new Date(rk.last_changed).getTime()) / 60000);
+      rks = `remote: ${rkv}, ${m < 60 ? m + " min" : m < 1440 ? Math.round(m / 60) + " h" : Math.round(m / 1440) + " d"} ago  ·  `;
+    }
+    $("age").textContent = rks + (isNaN(age) ? "" : `screen ${Math.round(age)} s old`);
     this.shadowRoot.querySelector("ha-card").classList.toggle("stale", !reach || age > 120);
   }
   getCardSize() { return 4; }

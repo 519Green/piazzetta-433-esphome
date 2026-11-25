@@ -122,6 +122,15 @@ piazzetta:
   derniere_trame:
     name: "Last frame"
     id: last_frame
+  # Key pressed on the real remote, one value per press. Also fired as HA event esphome.piazzetta_remote_key
+  # (data: key), so repeated presses of the same key each reach HA.
+  touche_telecommande:
+    name: "Remote key"
+    on_value:
+      - homeassistant.event:
+          event: esphome.piazzetta_remote_key
+          data:
+            key: !lambda 'return x;'
   heure:
     name: "Stove clock"
   rssi:

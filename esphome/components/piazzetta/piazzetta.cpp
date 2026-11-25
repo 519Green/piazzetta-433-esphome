@@ -516,6 +516,7 @@ void PiazzettaComponent::traiter_trame_(const std::vector<uint32_t> &durees, int
     this->nb_trames_corrigees_ += corrigee;
     this->derniere_telecommande_ms_ = millis();
     this->etat_entendu_ = o[1];
+    this->signaler_touche_(o);
     // Valeur brute du 2e octet (7 bits bas) : supposee temperature lue par la telecommande, non verifiee
     if (this->temperature_telecommande_ != nullptr) {
       float t = o[1] & 0x7F;
@@ -559,6 +560,49 @@ void PiazzettaComponent::traiter_trame_(const std::vector<uint32_t> &durees, int
         this->heure_->publish_state(h);
     }
   }
+}
+
+// Touche de la vraie telecommande, decodee pour HA (capteur « Remote key », une valeur par appui).
+// Octet 4 = touche, bits 5-6 = compteur ; octet 3 = 80 si la trappe est ouverte (autres noms).
+// Interrogations (80 / 00) ignorees. ⏻ : un appui long envoie 01 puis 21/41/61/A1 pendant ~2 s, un seul
+// signalement par appui. Autres touches : une trame identique dans la seconde est une repetition.
+void PiazzettaComponent::signaler_touche_(const std::vector<uint8_t> &o) {
+  if (this->touche_telecommande_ == nullptr)
+    return;
+  const uint8_t k = o[3], base = k & 0x9F;
+  const bool porte = (o[2] & 0x80) != 0;
+  const uint32_t ms = millis();
+  if (base == 0x80 || base == 0x00 || k == this->touche_interrogation_)
+    return;
+  const char *nom;
+  if ((k & 0x1F) == 0x01) {
+    const bool suite = this->dernier_marche_entendu_ms_ != 0 && ms - this->dernier_marche_entendu_ms_ < 3000;
+    this->dernier_marche_entendu_ms_ = ms;
+    if (suite)
+      return;
+    nom = "Power (on/off)";
+  } else {
+    if (k == this->derniere_touche_entendue_ && ms - this->derniere_touche_ms_ < 1000)
+      return;
+    this->derniere_touche_entendue_ = k;
+    this->derniere_touche_ms_ = ms;
+    switch (base) {
+      case 0x84: nom = porte ? "Menu" : "Fan menu"; break;
+      case 0x98: nom = porte ? "Set" : "Power menu"; break;
+      case 0x90: nom = porte ? "Esc" : "Setpoint menu"; break;
+      case 0x88: nom = "Plus"; break;
+      case 0x8C: nom = "Minus"; break;
+      case 0x8A: nom = "Opt"; break;
+      default: nom = nullptr;
+    }
+  }
+  char t[40];
+  if (nom != nullptr)
+    snprintf(t, sizeof(t), "%s", nom);
+  else
+    snprintf(t, sizeof(t), "Key %02X%s", k, porte ? " (door)" : "");
+  ESP_LOGI(TAG, "Telecommande : %s", t);
+  this->touche_telecommande_->publish_state(t);
 }
 
 void PiazzettaComponent::traiter_ecran_(const std::vector<uint8_t> &o) {
@@ -743,6 +787,7 @@ void PiazzettaComponent::traiter_ecran_(const std::vector<uint8_t> &o) {
     (e.ens_ecran == 1 ? this->ens_stop_vu_ : this->ens_start_vu_) = e.ens_valeur;
     if (sel != nullptr)
       sel->publish_state((size_t) (e.ens_valeur / 2));
+    this->sauver_ens_();
   }
 
   this->dernier_ecran_ = e;
@@ -1177,7 +1222,35 @@ void PiazzettaComponent::terminer_tache_(const char *bilan) {
 
 // ---------------------------------------------------------------- Cycle de vie
 
+// Valeurs Energy Saving en flash : octet bas STOP, octet haut START (0, 2, 4, 6 ; FF = jamais vu). Ecrit seulement
+// quand une valeur change (ecrans STOP/START, donc rarement).
+void PiazzettaComponent::sauver_ens_() {
+  const uint16_t v = (uint16_t) ((this->ens_stop_vu_ >= 0 ? this->ens_stop_vu_ : 0xFF) |
+                                 ((this->ens_start_vu_ >= 0 ? this->ens_start_vu_ : 0xFF) << 8));
+  if (v == this->ens_sauve_)
+    return;
+  this->ens_sauve_ = v;
+  this->pref_ens_.save(&v);
+}
+
 void PiazzettaComponent::setup() {
+  this->pref_ens_ = global_preferences->make_preference<uint16_t>(0x5E70E5u);
+  uint16_t ens;
+  if (this->pref_ens_.load(&ens)) {
+    this->ens_sauve_ = ens;
+    const int stop = ens & 0xFF, start = ens >> 8;
+    if (stop <= 6 && stop % 2 == 0) {
+      this->ens_stop_vu_ = stop;
+      if (this->ens_stop_ != nullptr)
+        this->ens_stop_->publish_state((size_t) (stop / 2));
+    }
+    if (start <= 6 && start % 2 == 0) {
+      this->ens_start_vu_ = start;
+      if (this->ens_start_ != nullptr)
+        this->ens_start_->publish_state((size_t) (start / 2));
+    }
+    ESP_LOGI(TAG, "Energy Saving repris de la flash : STOP %d, START %d (0xFF = jamais vu)", stop, start);
+  }
   // Etat initial des interrupteurs avant toute emission possible (par defaut ALWAYS_OFF : ecoute seule au demarrage)
   if (this->emission_ != nullptr) {
     auto init = this->emission_->get_initial_state_with_restore_mode();
