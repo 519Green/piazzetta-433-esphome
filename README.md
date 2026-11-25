@@ -1,5 +1,32 @@
 # Piazzetta 433 MHz → ESPHome / Home Assistant
 
+> [!NOTE]
+> **This is a fork** of [MaximeHTL/piazzetta-433-esphome](https://github.com/MaximeHTL/piazzetta-433-esphome), adapted to a different stove, remote and board. Everything below the line is the upstream README; the differences are listed here.
+
+## This fork
+
+| | Upstream | This fork |
+| --- | --- | --- |
+| Stove | Piazzetta (upstream's reference stove) | **Piazzetta P963 C** |
+| Remote | F0203-1480V3 | **MULTICOMFORT V5** (F02034130), °F display |
+| Board | ESP32 DevKit + Ra-02 (SX1278) module | **LilyGO T3 LoRa32 V1.6.1** (ESP32 + on-board SX1278, SSD1306 OLED) |
+| ESPHome config | `esphome/piazzetta-stove.yaml` | `esphome/piazzetta-p963-v5-lilygo.yaml` (upstream file kept unchanged) |
+
+LilyGO T3 V1.6.x pins (from LilyGo-LoRa-Series `utilities.h`): SCK 5, MISO 19, MOSI 27, CS 18, RST 23, DIO0 26, DIO1 33, DIO2 32, LED 25, OLED I2C SDA 21 / SCL 22. The test-bench firmware has a `CARTE_LILYGO_T3` switch for these pins.
+
+**Component additions** (`esphome/components/piazzetta`, options are opt-in, upstream configs keep working):
+* MULTICOMFORT V5 remote: configurable poll key (`touche_interrogation`, `0x80` on the V5), the V5 power long-press as a frame sequence (`sequence_maintien`, `periode_maintien`), rotating key counter, "door open" menu frames, optional copy of the remote's second byte (`copier_octet_etat`), listen-only and auto-sync switches.
+* Set values from Home Assistant: room setpoint (`consigne`), power and fan with their set values reported back, and `appuyer_touches()` for raw key sequences (exposed as a `press_keys` API action in the fork's config).
+* **Energy Saving** STOP / START selects: the board walks the stove menu (MENU > ENERGY SAVING > SET) and confirms each step from the screen; a *Paused* state.
+* Extra readings from the STOVE STATUS screen: exhaust temperature, exhaust fan rpm, auger feed.
+* Reception fixes: a frame whose checksum is `00` is no longer rejected (also offered upstream); during an Energy Saving walk, short `B9` frames update the value shown, a lost reply is followed by a poll instead of a second key press (repeated keys are not always ignored), and no walk starts within 3 min of a garbled screen (the stove garbles its own frames around ignition and pause).
+
+**Home Assistant** (`home-assistant/p963-v5/`): an LCD-style card that mirrors the remote's screen, a script that reads STOVE STATUS over the radio, and a package that logs burn/pause cycles, predicts the Energy Saving pause length from outdoor temperature and adapts the STOP band. Entity ids for weather, thermostat and notifications are placeholders to adapt.
+
+**Notes:** `docs/p963c-parameters-2026-11-20.md` lists the P963 C factory parameters read over the radio. The third-party manuals and parameter sheets it refers to are not redistributed (`docs/*.pdf` is ignored).
+
+---
+
 **Control a Piazzetta pellet stove from Home Assistant by talking to it over the air, exactly like its original radio remote does.**
 No wiring into the stove, no modification of the stove: an ESP32 and a 433 MHz radio module take the place of the remote.
 
